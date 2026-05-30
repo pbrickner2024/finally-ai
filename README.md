@@ -26,9 +26,8 @@ Single Docker container serving everything on port 8000:
 ## Quick Start
 
 ```bash
-# Clone and configure
-cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
+# Clone and add your key to .env
+# OPENROUTER_API_KEY=your-key-here
 
 # Run with Docker
 docker build -t finally .

@@ -454,3 +454,136 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Review Notes
+
+### Questions & Clarifications
+
+**Section 4 — Directory Structure**
+- `.env.example` is mentioned in the `.env` line comment but is absent from the directory tree. Add it explicitly so agents know to create it.
+ANSWER: Remove references to .env.example and replace them with .env
+
+**Section 5 — Environment Variables**
+- The plan says "backend reads `.env` from the project root." Inside a Docker container, the file is passed via `--env-file` and becomes plain environment variables — the process never sees the file. Clarify whether the backend should use `python-dotenv` (reads the file directly, useful for local dev outside Docker) or rely solely on `os.environ` (correct inside Docker). Both can coexist, but agents need to know which is expected.
+ANSWER: use python-dotenv
+
+**Section 6 — Market Data**
+- "Server pushes price updates for all tickers known to the system" — what does "known to the system" mean exactly? Is it strictly the watchlist table? If a user adds a new ticker to the watchlist mid-session, when does the simulator (or Massive poller) begin generating prices for it?
+- With Massive free tier (15s polling), the price flash animations and sparklines will update far less frequently than the simulator's 500ms. Should the plan note this UX degradation, or should the frontend handle both cadences gracefully?
+- The simulator section mentions "daily change %" is shown in the watchlist panel (Section 10), but the simulator has no concept of a daily open price. Clarify what "daily change %" means for simulated data — change since simulator start? Since the current calendar day? Since a fixed seed price?
+
+**Section 7 — Database**
+- `portfolio_snapshots` records `total_value` every 30 seconds indefinitely. Over days of use this table will grow without bound. Should there be a simple retention policy (e.g., keep the last 24 hours of snapshots)?
+- Is `total_value` defined as `cash_balance + sum(quantity * current_price)` for all positions? Making this explicit prevents divergent implementations.
+- The `users_profile` table name is grammatically awkward for a singular row. `user_profile` is cleaner (minor, but agents will copy this name everywhere).
+
+**Section 8 — API Endpoints**
+- `GET /api/portfolio` is described as returning "positions, cash balance, total value, unrealized P&L" but the exact response shape is not defined. Without a sample JSON shape, agents will invent different field names. Recommend adding a minimal example response for at least this endpoint (and `/api/watchlist`).
+- `GET /api/watchlist` says "current watchlist tickers with latest prices" — but this implies the backend merges price-cache data into the DB response. This cross-cutting concern should be called out explicitly, since agents implementing the route need to know to pull from the in-memory cache.
+
+**Section 9 — LLM Integration**
+- No limit is specified on how many messages are loaded from `chat_messages` for context. Over a long session this becomes an unbounded prompt. Recommend specifying a cap (e.g., last 20 messages).
+- The LLM mock response format is not defined. Agents implementing `LLM_MOCK=true` will invent different shapes. Add a single canonical mock response object.
+- Step 4 says "using the cerebras-inference skill" — but this is an agent authoring instruction, not a code pattern. Clarify what the actual Python call looks like (LiteLLM model string, base URL, etc.) so the Backend agent has a concrete target.
+
+**Section 10 — Frontend Design**
+- No mention of local development setup: when running Next.js dev server (`npm run dev` on port 3000) and FastAPI separately (port 8000), `/api/*` calls from the browser will hit port 3000 and fail. Agents need to know whether to configure a Next.js `rewrites` proxy in `next.config.js`, or whether local dev is always done inside Docker.
+
+**Section 11 — Docker**
+- The Dockerfile copies "frontend build output into a static/ directory" without specifying the exact source path (`frontend/out/` for `output: 'export'`) or target path inside the image. Agents need both paths to write the `COPY` instruction correctly.
+- No HEALTHCHECK instruction is mentioned in the Dockerfile, yet Section 8 includes a `/api/health` endpoint. These should be connected.
+
+---
+
+### Simplification Opportunities
+
+1. **UUID primary keys on `watchlist` and `positions`** — these tables already have a `UNIQUE(user_id, ticker)` constraint that serves as a natural key. The UUID `id` PK adds boilerplate to every query without benefit in a single-user app. Consider dropping `id` from these two tables and promoting the composite key to PRIMARY KEY.
+
+2. **Frontend unit tests** — React Testing Library setup for a static Next.js export adds significant scaffolding (jest, jsdom, mocks) for tests that largely duplicate the E2E coverage. For a capstone demo, omitting frontend unit tests and relying on E2E tests for critical paths would reduce build complexity meaningfully.
+
+3. **Start/stop scripts vs. docker-compose** — four script files (two platforms × two operations) maintaining the same Docker flags is fragile. A single `docker-compose.yml` with named volume, port mapping, and `env_file` covers both platforms and is a single source of truth. Consider making `docker-compose up --build` the primary dev interface and simplifying the scripts to thin wrappers around it.
+
+4. **`watchlist_changes` action field** — the structured output schema supports only `"add"` as an `action` but implicitly also needs `"remove"`. Add `"remove"` to the schema definition explicitly, or confirm `"add"` is the only valid value.
+
+5. **Error response format** — FastAPI defaults to `{"detail": "..."}` for HTTP errors. The plan doesn't specify an error format, so frontend agents will handle errors inconsistently. One line stating "use FastAPI's default error format" would close this gap.
+
+---
+
+## 14. Additional Review Notes
+
+### Unanswered Questions from Section 13
+
+The following items from Section 13 still require answers before agents can implement without ambiguity:
+
+**Section 6 — Market Data (unresolved)**
+- "Known to the system" for SSE streaming: clarify that the SSE endpoint streams prices for all tickers currently in the `watchlist` table. When a ticker is added to the watchlist mid-session, the background task should begin including it in the next update cycle. The frontend does not need a separate mechanism — the SSE stream naturally includes it.
+- Daily change % for simulated data: recommend defining this as change from the simulator's seed price (the starting price when the process started), displayed as "since open" or "since start" to avoid implying real daily data.
+- Massive API UX degradation at 15s polling: this is worth a brief note — sparklines and flash animations will feel sluggish. The frontend should handle both cadences without code changes (the flash CSS fires on any price update regardless of frequency).
+
+**Section 7 — Database (unresolved)**
+- Snapshot retention: recommend keeping last 24 hours only, deleting older rows as part of the snapshot background task (cheap, simple, no separate job needed).
+- `total_value` definition: confirm it is `cash_balance + sum(position.quantity * current_price)` for all open positions. Any divergence here causes the P&L chart and portfolio header to show different numbers.
+
+**Section 9 — LLM Integration (unresolved)**
+- Chat history cap: recommend capping at 20 messages (10 turns) to bound prompt size.
+- LLM mock canonical response: a concrete example is needed. Recommend this as the canonical mock:
+  ```json
+  {
+    "message": "I have reviewed your portfolio. You hold no positions currently. Consider buying some stocks.",
+    "trades": [],
+    "watchlist_changes": []
+  }
+  ```
+- Cerebras LiteLLM call: the concrete Python pattern is `litellm.completion(model="openrouter/openai/gpt-oss-120b", messages=[...], api_base="https://openrouter.ai/api/v1", api_key=os.environ["OPENROUTER_API_KEY"])` with `response_format` set to enforce structured output.
+
+### New Questions Not Addressed in Section 13
+
+**Section 2 — User Experience**
+- The positions table shows "% change" — is this the unrealized P&L percentage (relative to avg cost), or the daily price change percentage? These are different values. Clarify which column each label refers to.
+- When a position is fully sold (quantity reaches 0), should the row be deleted from `positions` or remain with `quantity=0`? The trade execution logic and the portfolio display both depend on this being consistent.
+
+**Section 6 — Market Data**
+- The SSE event payload is described as containing "ticker, price, previous price, timestamp, and change direction." The `change direction` field (up/down/flat) is redundant — it can be derived from `price > previous_price`. Removing it from the event simplifies both backend and frontend. If kept, clarify whether "flat" is a valid direction (i.e., price unchanged) or whether only "up"/"down" are emitted.
+- The price cache holds "latest price, previous price, and timestamp." Is this per-ticker? Confirm the data structure is a dict keyed by ticker symbol (e.g., `{"AAPL": {"price": 192.5, "prev_price": 191.8, "timestamp": "..."}}`). Without this, backend and SSE agents may structure it differently.
+
+**Section 7 — Database**
+- `trades` table has no index defined. With frequent trading activity the `WHERE user_id = 'default'` scans will be fine for SQLite at low volume, but if agents add `ORDER BY executed_at DESC` queries for history they should add an index. Mention whether indexes are in scope or left to the backend agent.
+- `chat_messages` stores `actions` as a JSON string in a TEXT column. No example JSON is given. Provide a minimal example (e.g., `{"trades": [{"ticker": "AAPL", "side": "buy", "quantity": 10, "price": 192.5}], "watchlist_changes": []}`). Without this, the backend agent and frontend will serialize/deserialize different shapes.
+
+**Section 8 — API Endpoints**
+- `POST /api/portfolio/trade` accepts `{ticker, quantity, side}`. What HTTP status code is returned on a validation failure (e.g., insufficient funds, invalid ticker, selling more than owned)? If it is 400 with `{"detail": "..."}`, say so. If it is 200 with an error field in the body, that is a different pattern.
+- `GET /api/portfolio/history` — no time range parameters are defined. Does it return all snapshots, or a fixed window (e.g., last 24 hours)? If the snapshot retention policy from Section 7 is adopted, this naturally limits the response, but it should be stated explicitly.
+- `GET /api/watchlist` response: does it include tickers for which no price is yet available in the cache (e.g., a ticker just added but not yet polled)? If yes, what value is returned for price — `null`, `0`, or the ticker is omitted until a price is available?
+- There is no `GET /api/chat` endpoint for loading conversation history. On page refresh, the chat panel would appear empty. Either add a history endpoint or explicitly state that chat history is not persisted across page loads in the UI (even though it is stored in the DB).
+
+**Section 9 — LLM Integration**
+- The system prompt instructs the LLM to "execute trades when the user asks or agrees." There is no mechanism for the LLM to ask for confirmation before executing. This is consistent with the auto-execution design, but the system prompt guidance should be explicit: the LLM must never ask "shall I execute this?" — it should execute and report.
+- What happens if the LLM returns a `trades` array with a ticker that is not in the watchlist? Does the backend add it to the watchlist automatically, reject the trade, or execute and leave the watchlist unchanged? This needs to be explicit.
+- Structured output schema: `quantity` type is not specified. Is it an integer or a float? Section 7 says "fractional shares supported" in the `positions` table, but the LLM schema should match. Confirm `quantity` in structured output is a number (float), not constrained to integer.
+
+**Section 10 — Frontend Design**
+- The AI chat panel is described as "docked/collapsible." Clarify what "collapsed" state shows — just a tab/button, or does it hide completely? This affects the overall layout grid.
+- Sparklines "accumulate from SSE stream since page load." How many data points should be shown? 50? 100? Is there a maximum? Without a cap, long-running sessions accumulate unbounded arrays in browser memory per ticker.
+- The trade bar has a "ticker field." Is this a free-text input or a dropdown/autocomplete from the current watchlist? Free text allows buying tickers not on the watchlist, which may be desirable or undesirable — clarify.
+
+**Section 11 — Docker**
+- The `--env-file .env` flag in the `docker run` example assumes the command is run from the project root. The start scripts should either enforce this (e.g., `cd` to script directory's parent) or use an absolute path. Without this, users running the script from a different working directory will get "env file not found" errors.
+- `python-dotenv` is confirmed in Section 13 for local dev. The Dockerfile should NOT copy `.env` into the image (it is gitignored for good reason). Confirm `.env` is in `.dockerignore` and that inside Docker, the backend relies on the environment variables injected via `--env-file`, with `python-dotenv` only loading the file when it is present on disk (i.e., `load_dotenv()` with no `override=True` is safe).
+
+**Section 12 — Testing**
+- The E2E test for "SSE resilience: disconnect and verify reconnection" is non-trivial to implement in Playwright. Playwright does not expose direct network interruption for SSE; this typically requires injecting a network fault or stopping/restarting the server. Either describe how this test is expected to work mechanically, or mark it as a stretch goal.
+- No mention of test data isolation: E2E tests that execute trades will mutate the database. If tests run sequentially against a shared container, later tests may see state from earlier ones. Clarify whether tests reset the DB between runs (e.g., by restarting the container or calling a reset endpoint) or are written to be order-independent.
+
+### Additional Simplification Opportunities
+
+6. **`change_direction` in SSE event** — this field is derivable from `price` and `previous_price`. Removing it reduces the event payload and eliminates a class of bugs (direction disagreeing with the prices). The frontend can compute direction inline.
+
+7. **`actions` JSON column in `chat_messages`** — since the backend already has structured output from the LLM, storing `actions` as a raw JSON string in SQLite is a serialization round-trip with no query benefit. For a single-user app where chat history is never queried by action type, this is fine, but confirm agents know to `json.dumps` on write and `json.loads` on read (or use a Pydantic model). A note here would prevent subtle bugs.
+
+8. **`GET /api/chat` history endpoint** — if the frontend loads chat history on startup (to repopulate the panel after a refresh), a simple `GET /api/chat?limit=50` endpoint using the same `chat_messages` table avoids duplicating the data fetch pattern. If this endpoint is not planned, explicitly state that the chat panel starts empty on every page load, so the Frontend agent does not build an unnecessary fetch.
+
+9. **Background task for portfolio snapshots** — two background tasks are implied: one for market data (simulator or Massive poller) and one for portfolio snapshots. Both run on intervals. These should use the same mechanism (FastAPI `lifespan` with `asyncio.create_task`) rather than mixing `BackgroundTasks` (per-request) and startup events. Make the task mechanism explicit so the backend agent does not mix patterns.
+
+10. **Ticker validation** — `POST /api/watchlist` and `POST /api/portfolio/trade` both accept a `ticker` string. There is no mention of whether the backend validates that the ticker is a real (or at least plausible) symbol. For the simulator, any string is valid (it will just start generating prices for it). For the Massive API, an invalid ticker will return no data. A simple length/format check (e.g., 1-5 uppercase letters) would prevent garbage entries without adding significant complexity.
